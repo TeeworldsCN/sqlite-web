@@ -14,19 +14,19 @@ struct TimeoutEntry {
 /// Timeout queue that manages worker interruptions
 pub struct TimeoutCollection {
     entries: Arc<Mutex<HashMap<usize, TimeoutEntry>>>,
-    shutdown_flag: Arc<AtomicBool>,
+    disconnect_flag: Arc<AtomicBool>,
     next_id: AtomicUsize,
 }
 
 impl TimeoutCollection {
     pub fn new() -> Self {
         let entries = Arc::new(Mutex::new(HashMap::new()));
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let disconnect_flag = Arc::new(AtomicBool::new(false));
         let next_id = AtomicUsize::new(1);
 
         Self {
             entries,
-            shutdown_flag,
+            disconnect_flag,
             next_id,
         }
     }
@@ -41,7 +41,7 @@ impl TimeoutCollection {
         let mut entries_lock = self.entries.lock().unwrap();
 
         // If shutdown was requested, don't add new timeouts
-        if self.shutdown_flag.load(Ordering::SeqCst) {
+        if self.disconnect_flag.load(Ordering::SeqCst) {
             return 0;
         }
 
@@ -49,13 +49,7 @@ impl TimeoutCollection {
         let entry = TimeoutEntry { interrupt_handle };
 
         entries_lock.insert(id, entry);
-        debug!(
-            "Added timeout entry {} with duration {:?}",
-            id, timeout_duration
-        );
-
-        // Release the lock before spawning the thread to avoid holding it during thread creation
-        drop(entries_lock);
+        debug!("Added timeout entry {}", id);
 
         // Start a dedicated thread for this timeout
         let entries = Arc::clone(&self.entries);
@@ -89,18 +83,21 @@ impl TimeoutCollection {
     /// Remove a timeout entry from the queue
     pub fn remove_timeout(&self, id: usize) {
         let mut entries_lock = self.entries.lock().unwrap();
-        entries_lock.remove(&id);
-        debug!("Removed timeout entry {}", id);
+        if entries_lock.remove(&id).is_some() {
+            debug!("Timeout entry finished {}", id);
+        }
+
         // Lock is automatically released when entries_lock goes out of scope
     }
 
     /// Stop the timeout monitoring thread
     pub fn interrupt_all(&self) {
         let mut entries_lock = self.entries.lock().unwrap();
-        info!("Timeout interrupt shutdown initiated");
+        self.disconnect_flag.store(true, Ordering::SeqCst);
 
-        self.shutdown_flag.store(true, Ordering::SeqCst);
-
+        if !entries_lock.is_empty() {
+            info!("Interrupting all timeouts");
+        }
         for (_, entry) in entries_lock.drain() {
             entry.interrupt_handle.interrupt();
         }

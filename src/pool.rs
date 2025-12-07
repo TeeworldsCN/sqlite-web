@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use log::info;
+use log::{debug, info};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
@@ -35,5 +35,8 @@ pub fn create_connection_pool(
 pub fn get_connection_from_pool(
     pool: &DbPool,
 ) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, ApiError> {
-    pool.get().map_err(|e| ApiError::QueueError(e))
+    pool.get().map_err(|e| {
+        debug!("{}", e);
+        ApiError::QueueError(e)
+    })
 }
