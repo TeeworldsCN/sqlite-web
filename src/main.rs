@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     info!("Configuration loaded: {:?}", config);
 
     // Create timeout queue
-    let timeout_queue = Arc::new(timeout::TimeoutQueue::new());
+    let timeout_queue = Arc::new(timeout::TimeoutCollection::new());
     timeout_queue.start_monitoring();
 
     // Create shutdown flag

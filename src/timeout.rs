@@ -13,12 +13,12 @@ struct TimeoutEntry {
 }
 
 /// Timeout queue that manages worker interruptions
-pub struct TimeoutQueue {
+pub struct TimeoutCollection {
     entries: Arc<Mutex<HashMap<String, TimeoutEntry>>>,
     shutdown_flag: Arc<AtomicBool>,
 }
 
-impl TimeoutQueue {
+impl TimeoutCollection {
     pub fn new() -> Self {
         let entries = Arc::new(Mutex::new(HashMap::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));

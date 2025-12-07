@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use crate::timeout::TimeoutQueue;
+use crate::timeout::TimeoutCollection;
 use base64::Engine;
 use log::{debug, error, info};
 use std::collections::VecDeque;
@@ -19,7 +19,7 @@ pub struct Worker {
     id: usize,
     db_pool: Arc<crate::pool::DbPool>,
     max_query_time: Duration,
-    timeout_queue: Arc<TimeoutQueue>,
+    timeout_queue: Arc<TimeoutCollection>,
     result_sender: mpsc::Sender<(String, QueryResult)>,
 }
 
@@ -28,7 +28,7 @@ impl Worker {
         id: usize,
         db_pool: Arc<crate::pool::DbPool>,
         max_query_time: Duration,
-        timeout_queue: Arc<TimeoutQueue>,
+        timeout_queue: Arc<TimeoutCollection>,
         result_sender: mpsc::Sender<(String, QueryResult)>,
     ) -> Self {
         info!("Worker {} initialized with connection pool", id);
@@ -189,7 +189,7 @@ impl WorkerPool {
     pub fn new(
         worker_count: usize,
         max_query_time: Duration,
-        timeout_queue: Arc<TimeoutQueue>,
+        timeout_queue: Arc<TimeoutCollection>,
         db_pool: Arc<crate::pool::DbPool>,
     ) -> (
         Self,
