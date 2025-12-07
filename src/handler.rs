@@ -106,7 +106,6 @@ async fn handle_query(
     let connection = match crate::pool::get_connection_from_pool(&db_pool) {
         Ok(conn) => conn,
         Err(e) => {
-            println!("Connection noooo!!");
             let response = QueryResponse {
                 success: false,
                 result: None,
