@@ -76,7 +76,6 @@ async fn main() -> Result<()> {
             info!("Received shutdown signal, initiating graceful shutdown...");
 
             // Stop timeout queue monitoring
-            // This will also interrupt every connection in the pool
             timeout_queue.stop_monitoring();
 
             // Set shutdown flag to prevent new queries
