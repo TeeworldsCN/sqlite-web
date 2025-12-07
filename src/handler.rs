@@ -53,6 +53,8 @@ pub async fn start_server(
 
     let listener = TcpListener::bind(addr).await?;
     info!("Starting HTTP server on {}", addr);
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut signal = std::pin::pin!(shutdown_signal());
 
     let state: Arc<AppState> = Arc::new(AppState {
         max_query_time_ms,
@@ -60,64 +62,75 @@ pub async fn start_server(
     });
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
+        tokio::select! {
+            Ok((stream, _addr)) = listener.accept() => {
+                let http: http1::Builder = http1::Builder::new();
+                let state = state.clone();
 
-        let state = state.clone();
+                // Create timeout queue
+                let timeout = Arc::new(TimeoutCollection::new());
 
-        tokio::spawn(async move {
-            // Create timeout queue
-            let timeout = Arc::new(TimeoutCollection::new());
+                // Create shutdown flag
+                let disconnect_flag = Arc::new(AtomicBool::new(false));
 
-            // Create shutdown flag
-            let disconnect_flag = Arc::new(AtomicBool::new(false));
+                let connection_state = Arc::new(ConnectionState {
+                    disconnect_flag: disconnect_flag.clone(),
+                    timeout: timeout.clone(),
+                });
 
-            let connection_state = Arc::new(ConnectionState {
-                disconnect_flag: disconnect_flag.clone(),
-                timeout: timeout.clone(),
-            });
-
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| {
-                        let state = state.clone();
-                        let connection_state = connection_state.clone();
-                        async move {
-                            if connection_state.disconnect_flag.load(Ordering::SeqCst) {
-                                debug!("Disconnected, aborting query.");
-                                let response = QueryResponse {
-                                    success: false,
-                                    result: None,
-                                    error: Some("Aborted".to_string()),
-                                    query_time_ms: None,
-                                };
-                                return Ok(json_response(
-                                    response,
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                ));
+                let io = TokioIo::new(stream);
+                let conn = http
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let state = state.clone();
+                            let connection_state = connection_state.clone();
+                            async move {
+                                if connection_state.disconnect_flag.load(Ordering::SeqCst) {
+                                    debug!("Disconnected, aborting query.");
+                                    let response = QueryResponse {
+                                        success: false,
+                                        result: None,
+                                        error: Some("Aborted".to_string()),
+                                        query_time_ms: None,
+                                    };
+                                    return Ok(json_response(
+                                        response,
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                    ));
+                                }
+                                handle_request(req, state, connection_state).await
                             }
-                            handle_request(req, state, connection_state).await
-                        }
-                    }),
-                )
-                .with_upgrades()
-                .await
-            {
-                disconnect_flag.store(true, Ordering::SeqCst);
-                timeout.interrupt_all();
-                debug!("Connection error: {}", err);
-
-                // Check if this is a connection closure error
-                if err.to_string().contains("connection closed")
-                    || err.to_string().contains("reset")
-                    || err.to_string().contains("broken pipe")
-                {
-                    debug!("Client disconnected abruptly");
-                }
+                        }),
+                    );
+                let fut = graceful.watch(conn);
+                tokio::spawn(async move {
+                    if let Err(err) = fut.await
+                    {
+                        disconnect_flag.store(true, Ordering::SeqCst);
+                        timeout.interrupt_all();
+                        debug!("Connection error: {}", err);
+                    }
+                });
+            },
+            _ = &mut signal => {
+                drop(listener);
+                info!("Shutting down HTTP server");
+                break;
             }
-        });
+        }
     }
+
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            info!("all connections gracefully closed");
+        },
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            info!("timed out wait for all connections to close");
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_request(
@@ -339,4 +352,11 @@ fn json_response(data: impl Serialize, status: StatusCode) -> Response<Full<Byte
         .header(header::CONTENT_TYPE, "application/json")
         .body(Full::from(json_body))
         .unwrap()
+}
+
+async fn shutdown_signal() {
+    // Wait for the CTRL+C signal
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install CTRL+C signal handler");
 }

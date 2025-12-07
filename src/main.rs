@@ -1,6 +1,5 @@
 use anyhow::Result;
 use log::info;
-use std::time::Duration;
 mod config;
 mod error;
 mod handler;
@@ -31,30 +30,13 @@ async fn main() -> Result<()> {
     );
 
     // Start the server in a separate task
-    let server_task = tokio::spawn(handler::start_server(
+    let _ = handler::start_server(
         config.max_query_time_ms,
         db_pool,
         config.listen_address.clone(),
         config.listen_port,
-    ));
-
-    // Wait for shutdown signal
-    let _ = tokio::signal::ctrl_c().await;
-
-    info!("Received shutdown signal, initiating graceful shutdown...");
-
-    // timeout.interrupt_all();
-
-    // // Set shutdown flag to prevent new queries
-    // disconnect_flag.store(true, Ordering::SeqCst);
-
-    // Give a brief moment for in-flight responses to complete (100ms)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Cancel the server task
-    server_task.abort();
-
-    info!("Graceful shutdown complete");
+    )
+    .await;
 
     info!("Server shutdown complete");
 
