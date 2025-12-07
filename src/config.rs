@@ -6,7 +6,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database_path: String,
-    pub max_concurrent_queries: usize,
+    pub max_concurrent_queries: u32,
+    pub max_queue_timeout_ms: u64,
     pub max_query_time_ms: u64,
     pub listen_address: String,
     pub listen_port: u16,
@@ -31,6 +32,7 @@ impl Config {
                 Self {
                     database_path: "data.db".to_string(),
                     max_concurrent_queries: 4,
+                    max_queue_timeout_ms: 1000,
                     max_query_time_ms: 5000,
                     listen_address: "0.0.0.0".to_string(),
                     listen_port: 8080,

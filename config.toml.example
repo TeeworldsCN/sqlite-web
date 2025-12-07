@@ -6,6 +6,9 @@ database_path = "data.sqlite"
 # Number of worker threads for query execution
 max_concurrent_queries = 16
 
+# Max queue timeout time in milliseconds
+max_queue_timeout_ms = 1000
+
 # Maximum query execution time in milliseconds
 max_query_time_ms = 250
 

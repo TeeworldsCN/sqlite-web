@@ -7,7 +7,11 @@ use std::time::Duration;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-pub fn create_connection_pool(database_path: &str, pool_size: u32) -> Result<DbPool, ApiError> {
+pub fn create_connection_pool(
+    database_path: &str,
+    pool_size: u32,
+    timeout: u64,
+) -> Result<DbPool, ApiError> {
     info!(
         "Creating connection pool for database: {} with {} connections",
         database_path, pool_size
@@ -20,9 +24,9 @@ pub fn create_connection_pool(database_path: &str, pool_size: u32) -> Result<DbP
     // Build the connection pool
     let pool = Pool::builder()
         .max_size(pool_size)
-        .connection_timeout(Duration::from_secs(5))
+        .connection_timeout(Duration::from_millis(timeout))
         .build(manager)
-        .map_err(|e| ApiError::WorkerError(format!("Failed to create connection pool: {}", e)))?;
+        .map_err(|e| ApiError::QueueError(e))?;
 
     info!("Connection pool created successfully");
     Ok(pool)
@@ -31,6 +35,5 @@ pub fn create_connection_pool(database_path: &str, pool_size: u32) -> Result<DbP
 pub fn get_connection_from_pool(
     pool: &DbPool,
 ) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, ApiError> {
-    pool.get()
-        .map_err(|e| ApiError::WorkerError(format!("Failed to get connection from pool: {}", e)))
+    pool.get().map_err(|e| ApiError::QueueError(e))
 }

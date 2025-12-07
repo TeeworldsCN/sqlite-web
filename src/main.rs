@@ -1,6 +1,5 @@
 use anyhow::Result;
 use log::info;
-use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -23,54 +22,51 @@ async fn main() -> Result<()> {
     info!("Configuration loaded: {:?}", config);
 
     // Create timeout queue
-    let timeout_queue = Arc::new(timeout::TimeoutCollection::new());
-    timeout_queue.start_monitoring();
+    let timeout = Arc::new(timeout::TimeoutCollection::new());
 
     // Create shutdown flag
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     // Create connection pool
-    let db_pool =
-        pool::create_connection_pool(&config.database_path, config.max_concurrent_queries as u32)?;
-
-    // Set up HTTP routes with connection pool and shutdown flag
-    let routes = handler::create_routes(
-        Arc::clone(&shutdown_flag),
-        config.max_query_time_ms,
-        db_pool,
-        Arc::clone(&timeout_queue),
-    );
+    let db_pool = pool::create_connection_pool(
+        &config.database_path,
+        config.max_concurrent_queries,
+        config.max_queue_timeout_ms,
+    )?;
 
     // Start HTTP server
     info!(
         "Starting HTTP server on {}:{}",
         config.listen_address, config.listen_port
     );
-    let socket_addr: SocketAddr = format!("{}:{}", config.listen_address, config.listen_port)
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid socket address: {}", e))?;
 
-    warp::serve(routes)
-        .bind(socket_addr)
-        .await
-        .graceful(async move {
-            let _ = tokio::signal::ctrl_c().await;
+    // Start the server in a separate task
+    let server_task = tokio::spawn(handler::start_server(
+        Arc::clone(&shutdown_flag),
+        config.max_query_time_ms,
+        db_pool,
+        Arc::clone(&timeout),
+        config.listen_address.clone(),
+        config.listen_port,
+    ));
 
-            info!("Received shutdown signal, initiating graceful shutdown...");
+    // Wait for shutdown signal
+    let _ = tokio::signal::ctrl_c().await;
 
-            // Stop timeout queue monitoring
-            timeout_queue.stop_monitoring();
+    info!("Received shutdown signal, initiating graceful shutdown...");
 
-            // Set shutdown flag to prevent new queries
-            shutdown_flag.store(true, Ordering::SeqCst);
+    timeout.interrupt_all();
 
-            // Give a brief moment for in-flight responses to complete (100ms)
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    // Set shutdown flag to prevent new queries
+    shutdown_flag.store(true, Ordering::SeqCst);
 
-            info!("Graceful shutdown complete");
-        })
-        .run()
-        .await;
+    // Give a brief moment for in-flight responses to complete (100ms)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Cancel the server task
+    server_task.abort();
+
+    info!("Graceful shutdown complete");
 
     info!("Server shutdown complete");
 

@@ -1,12 +1,20 @@
 use crate::error::ApiError;
 use base64::Engine;
-use log::debug;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::header;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
-use warp::{Filter, Rejection, Reply};
+use tokio::net::TcpListener;
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
@@ -21,70 +29,134 @@ pub struct QueryResponse {
     pub query_time_ms: Option<u64>,
 }
 
-pub fn create_routes(
+pub struct AppState {
+    pub shutdown_flag: Arc<AtomicBool>,
+    pub max_query_time_ms: u64,
+    pub db_pool: crate::pool::DbPool,
+    pub timeout: Arc<crate::timeout::TimeoutCollection>,
+}
+
+pub async fn start_server(
     shutdown_flag: Arc<AtomicBool>,
     max_query_time_ms: u64,
     db_pool: crate::pool::DbPool,
-    timeout_queue: Arc<crate::timeout::TimeoutCollection>,
-) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
-    // POST /query endpoint
-    let query_route = warp::path("query")
-        .and(warp::post())
-        .and(warp::body::json())
-        .and(with_shutdown_flag(shutdown_flag))
-        .and(with_db_pool(db_pool))
-        .and(with_timeout_queue(timeout_queue))
-        .and(with_max_query_time(max_query_time_ms))
-        .and_then(handle_query);
+    timeout: Arc<crate::timeout::TimeoutCollection>,
+    listen_address: String,
+    listen_port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr: SocketAddr = format!("{}:{}", listen_address, listen_port)
+        .parse()
+        .map_err(|e: std::net::AddrParseError| format!("Invalid socket address: {}", e))?;
 
-    // Health check endpoint
-    let health_route = warp::path("health").and(warp::get()).map(move || {
-        warp::reply::json(&serde_json::json!({
-            "status": "healthy",
-            "max_query_time_ms": max_query_time_ms
-        }))
+    let listener = TcpListener::bind(addr).await?;
+    info!("Starting HTTP server on {}", addr);
+
+    let state = Arc::new(AppState {
+        shutdown_flag,
+        max_query_time_ms,
+        db_pool,
+        timeout,
     });
 
-    // Combine routes
-    query_route.or(health_route)
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+
+        let state = state.clone();
+
+        tokio::spawn(async move {
+            let disconnect_flag = Arc::new(AtomicBool::new(false));
+            let disconnect_flag_clone = disconnect_flag.clone();
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(move |req| {
+                        let state = state.clone();
+                        let disconnect_flag = disconnect_flag.clone();
+                        async move { handle_request(req, state, disconnect_flag).await }
+                    }),
+                )
+                .with_upgrades()
+                .await
+            {
+                disconnect_flag_clone.store(true, Ordering::SeqCst);
+                debug!("Connection error: {}", err);
+
+                // Check if this is a connection closure error
+                if err.to_string().contains("connection closed")
+                    || err.to_string().contains("reset")
+                    || err.to_string().contains("broken pipe")
+                {
+                    debug!("Client disconnected abruptly");
+                }
+            }
+        });
+    }
 }
 
-fn with_shutdown_flag(
-    shutdown_flag: Arc<AtomicBool>,
-) -> impl Filter<Extract = (Arc<AtomicBool>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || shutdown_flag.clone())
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+    disconnect_flag: Arc<AtomicBool>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let path = req.uri().path();
+    let method = req.method();
+
+    match (method, path) {
+        (&Method::POST, "/query") => handle_query(req, state, disconnect_flag).await,
+        (&Method::GET, "/health") => handle_health(state).await,
+        _ => Ok(not_found_response()),
+    }
 }
 
-fn with_db_pool(
-    db_pool: crate::pool::DbPool,
-) -> impl Filter<Extract = (crate::pool::DbPool,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || db_pool.clone())
-}
+async fn handle_health(state: Arc<AppState>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let response_body = serde_json::json!({
+        "status": "healthy",
+        "max_query_time_ms": state.max_query_time_ms
+    });
 
-fn with_timeout_queue(
-    timeout_queue: Arc<crate::timeout::TimeoutCollection>,
-) -> impl Filter<Extract = (Arc<crate::timeout::TimeoutCollection>,), Error = std::convert::Infallible>
-       + Clone {
-    warp::any().map(move || timeout_queue.clone())
-}
-
-fn with_max_query_time(
-    max_query_time_ms: u64,
-) -> impl Filter<Extract = (u64,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || max_query_time_ms)
+    Ok(json_response(response_body, StatusCode::OK))
 }
 
 async fn handle_query(
-    query_request: QueryRequest,
-    shutdown_flag: Arc<AtomicBool>,
-    db_pool: crate::pool::DbPool,
-    timeout_queue: Arc<crate::timeout::TimeoutCollection>,
-    max_query_time_ms: u64,
-) -> Result<impl Reply, Rejection> {
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+    disconnect_flag: Arc<AtomicBool>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Read the request body
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            debug!("Failed to read request body: {}", e);
+            let response = QueryResponse {
+                success: false,
+                result: None,
+                error: Some("Failed to read request body".to_string()),
+                query_time_ms: None,
+            };
+            return Ok(json_response(response, StatusCode::BAD_REQUEST));
+        }
+    };
+
+    // Parse JSON request
+    let query_request: QueryRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            debug!("Failed to parse JSON request: {}", e);
+            let response = QueryResponse {
+                success: false,
+                result: None,
+                error: Some("Invalid JSON format".to_string()),
+                query_time_ms: None,
+            };
+            return Ok(json_response(response, StatusCode::BAD_REQUEST));
+        }
+    };
+
     debug!("Received query request: {}", query_request.sql);
 
     // Check if shutdown is in progress
-    if shutdown_flag.load(Ordering::SeqCst) {
+    if state.shutdown_flag.load(Ordering::SeqCst) {
         debug!("Shutdown in progress, returning 503 Service Unavailable");
         let response = QueryResponse {
             success: false,
@@ -92,36 +164,42 @@ async fn handle_query(
             error: Some("Service is shutting down".to_string()),
             query_time_ms: None,
         };
-        return Ok(warp::reply::with_status(
-            warp::reply::json(&response),
-            warp::http::StatusCode::SERVICE_UNAVAILABLE,
-        ));
+        return Ok(json_response(response, StatusCode::SERVICE_UNAVAILABLE));
     }
 
-    // Execute query directly with timeout management
-    let _query_id = Uuid::new_v4().to_string();
-    let max_query_time = Duration::from_millis(max_query_time_ms);
-
     // Get connection from pool
-    let connection = match crate::pool::get_connection_from_pool(&db_pool) {
+    let connection = match crate::pool::get_connection_from_pool(&state.db_pool) {
         Ok(conn) => conn,
         Err(e) => {
             let response = QueryResponse {
                 success: false,
                 result: None,
-                error: Some(format!("Failed to get database connection: {}", e)),
+                error: Some(e.to_string()),
                 query_time_ms: None,
             };
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&response),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Ok(json_response(response, StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
 
-    // Add timeout entry to the queue
+    let max_query_time = Duration::from_millis(state.max_query_time_ms);
+
+    // already disconnected, quickly return
+    if disconnect_flag.load(Ordering::SeqCst) {
+        debug!("Connection aborted, skip executing query");
+        let response = QueryResponse {
+            success: false,
+            result: None,
+            error: Some("Aborted".to_string()),
+            query_time_ms: None,
+        };
+        return Ok(json_response(response, StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    // start timeout
     let interrupt_handle = Arc::new(connection.get_interrupt_handle());
-    let timeout_id = timeout_queue.add_timeout(Arc::clone(&interrupt_handle), max_query_time);
+    let timeout_id = state
+        .timeout
+        .add_timeout(Arc::clone(&interrupt_handle), max_query_time);
 
     // Execute the query with timeout monitoring
     let start_time = Instant::now();
@@ -185,7 +263,7 @@ async fn handle_query(
     .await;
 
     // Remove the timeout entry from the queue
-    timeout_queue.remove_timeout(&timeout_id);
+    state.timeout.remove_timeout(timeout_id);
 
     // Process the result
     let result = match result {
@@ -193,30 +271,8 @@ async fn handle_query(
             let query_time_ms = Some(start_time.elapsed().as_millis() as u64);
             Ok((query_result, query_time_ms))
         }
-        Ok(Err(e)) => {
-            // Check if the error is due to query interruption
-            if format!("{}", e).contains("interrupted") || format!("{}", e).contains("Interrupted")
-            {
-                Err(ApiError::WorkerError("Query timeout".to_string()))
-            } else {
-                Err(ApiError::WorkerError(format!(
-                    "Query execution failed: {}",
-                    e
-                )))
-            }
-        }
-        Err(e) => {
-            // Check if the error is due to query interruption
-            if format!("{}", e).contains("interrupted") || format!("{}", e).contains("Interrupted")
-            {
-                Err(ApiError::WorkerError("Query timeout".to_string()))
-            } else {
-                Err(ApiError::WorkerError(format!(
-                    "Query execution failed: {}",
-                    e
-                )))
-            }
-        }
+        Ok(Err(e)) => Err(ApiError::QueryError(e)),
+        Err(e) => Err(ApiError::ThreadError(e)),
     };
 
     match result {
@@ -227,22 +283,56 @@ async fn handle_query(
                 error: None,
                 query_time_ms: query_time_ms,
             };
-            Ok(warp::reply::with_status(
-                warp::reply::json(&response),
-                warp::http::StatusCode::OK,
-            ))
+            Ok(json_response(response, StatusCode::OK))
         }
         Err(e) => {
             let response = QueryResponse {
                 success: false,
                 result: None,
-                error: Some(format!("Query execution failed: {}", e)),
+                error: Some(e.to_string()),
                 query_time_ms: None,
             };
-            Ok(warp::reply::with_status(
-                warp::reply::json(&response),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ))
+            Ok(json_response(response, StatusCode::INTERNAL_SERVER_ERROR))
         }
     }
+}
+
+fn json_response(data: impl Serialize, status: StatusCode) -> Response<Full<Bytes>> {
+    let json_body = match serde_json::to_vec(&data) {
+        Ok(body) => body,
+        Err(_) => {
+            let error_response = serde_json::json!({
+                "error": "Failed to serialize response"
+            });
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::from(
+                    serde_json::to_string(&error_response).unwrap_or_else(|_| {
+                        "{\"error\":\"Failed to serialize response\"}".to_string()
+                    }),
+                ))
+                .unwrap();
+        }
+    };
+
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::from(json_body))
+        .unwrap()
+}
+
+fn not_found_response() -> Response<Full<Bytes>> {
+    let response = serde_json::json!({
+        "error": "Not found",
+    });
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::from(
+            serde_json::to_string(&response)
+                .unwrap_or_else(|_| "{\"error\":\"Not found\"}".to_string()),
+        ))
+        .unwrap()
 }
