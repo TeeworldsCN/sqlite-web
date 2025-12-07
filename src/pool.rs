@@ -20,7 +20,7 @@ pub fn create_connection_pool(database_path: &str, pool_size: u32) -> Result<DbP
     // Build the connection pool
     let pool = Pool::builder()
         .max_size(pool_size)
-        .connection_timeout(Duration::from_secs(30))
+        .connection_timeout(Duration::from_secs(5))
         .build(manager)
         .map_err(|e| ApiError::WorkerError(format!("Failed to create connection pool: {}", e)))?;
 

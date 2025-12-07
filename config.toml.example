@@ -1,13 +1,13 @@
 # SQLite Web API Configuration
 
 # Path to SQLite database file
-database_path = "/mnt/data/ddnet.sqlite"
+database_path = "data.sqlite"
 
 # Number of worker threads for query execution
-worker_count = 4
+max_concurrent_queries = 16
 
 # Maximum query execution time in milliseconds
-max_query_time_ms = 2000
+max_query_time_ms = 250
 
 # HTTP server listen address
 listen_address = "0.0.0.0"

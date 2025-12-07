@@ -6,7 +6,7 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database_path: String,
-    pub worker_count: usize,
+    pub max_concurrent_queries: usize,
     pub max_query_time_ms: u64,
     pub listen_address: String,
     pub listen_port: u16,
@@ -30,7 +30,7 @@ impl Config {
                 // Provide defaults if config file/environment variables are missing
                 Self {
                     database_path: "data.db".to_string(),
-                    worker_count: 4,
+                    max_concurrent_queries: 4,
                     max_query_time_ms: 5000,
                     listen_address: "0.0.0.0".to_string(),
                     listen_port: 8080,
@@ -39,8 +39,8 @@ impl Config {
         };
 
         // Validate configuration
-        if config.worker_count == 0 {
-            return Err(anyhow::anyhow!("worker_count must be at least 1"));
+        if config.max_concurrent_queries == 0 {
+            return Err(anyhow::anyhow!("max_concurrent_queries must be at least 1"));
         }
 
         if !Path::new(&config.database_path).exists() {

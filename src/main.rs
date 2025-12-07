@@ -11,7 +11,6 @@ mod error;
 mod handler;
 mod pool;
 mod timeout;
-mod worker;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,31 +30,15 @@ async fn main() -> Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     // Create connection pool
-    let db_pool = Arc::new(pool::create_connection_pool(
-        &config.database_path,
-        config.worker_count as u32,
-    )?);
-
-    // Create worker pool
-    let (mut worker_pool, query_tx, result_rx) = worker::WorkerPool::new(
-        config.worker_count,
-        Duration::from_millis(config.max_query_time_ms),
-        Arc::clone(&timeout_queue),
-        Arc::clone(&db_pool),
-    );
-
-    // Start worker pool in current thread
-    let worker_task = tokio::spawn(async move {
-        worker_pool.run().await;
-    });
+    let db_pool =
+        pool::create_connection_pool(&config.database_path, config.max_concurrent_queries as u32)?;
 
     // Set up HTTP routes with connection pool and shutdown flag
-    let result_rx_arc = Arc::new(tokio::sync::Mutex::new(result_rx));
     let routes = handler::create_routes(
         Arc::clone(&shutdown_flag),
         config.max_query_time_ms,
-        query_tx.clone(),
-        Arc::clone(&result_rx_arc),
+        db_pool,
+        Arc::clone(&timeout_queue),
     );
 
     // Start HTTP server
@@ -80,18 +63,9 @@ async fn main() -> Result<()> {
 
             // Set shutdown flag to prevent new queries
             shutdown_flag.store(true, Ordering::SeqCst);
-            // Send shutdown notification to worker pool
-            let _ = query_tx
-                .send(("SHUTDOWN".to_string(), "".to_string()))
-                .await;
 
             // Give a brief moment for in-flight responses to complete (100ms)
             tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let _ = worker_task.await;
-
-            // Close the connection pool
-            drop(db_pool);
 
             info!("Graceful shutdown complete");
         })
